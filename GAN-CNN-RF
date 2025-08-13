@@ -1,0 +1,232 @@
+#Library Import
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, BatchNormalization, Dropout, GlobalAveragePooling2D, Input, LeakyReLU, Flatten, Reshape, UpSampling2D, Add
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.callbacks import LearningRateScheduler, ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# Load dataset
+filename = '/kaggle/input/metadata-processed-csv/metadata_processed.csv'
+df = pd.read_csv(filename, names=['emotion', 'pixels', 'usage'], na_filter=False)
+
+def getData(filename):
+    Y, X = [], []
+    first = True
+    for line in open(filename):
+        if first:
+            first = False
+        else:
+            row = line.split(',')
+            Y.append(int(row[0]))
+            X.append([int(p) for p in row[1].split()])
+    return np.array(X) / 255.0, np.array(Y)
+
+X, Y = getData(filename)
+
+# Data Preprocessing
+num_classes = len(set(Y))
+X = X.reshape(-1, 48, 48, 1)
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.1, random_state=0)
+y_train_onehot = to_categorical(y_train, num_classes=num_classes)
+y_test_onehot = to_categorical(y_test, num_classes=num_classes)
+class_weights = compute_class_weight('balanced', classes=np.unique(Y), y=Y)
+class_weights_dict = dict(enumerate(class_weights))
+
+# GAN: Generator
+def build_generator():
+    model = Sequential()
+    model.add(Dense(128 * 12 * 12, activation="relu", input_dim=100))
+    model.add(Reshape((12, 12, 128)))
+    model.add(UpSampling2D())
+    model.add(Conv2D(128, kernel_size=3, padding="same"))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(LeakyReLU(alpha=0.2))
+    
+    model.add(UpSampling2D())
+    model.add(Conv2D(64, kernel_size=3, padding="same"))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(LeakyReLU(alpha=0.2))
+
+    model.add(Conv2D(1, kernel_size=3, padding="same", activation='tanh'))
+    
+    noise = Input(shape=(100,))
+    img = model(noise)
+    
+    return Model(noise, img)
+
+# GAN: Discriminator
+def build_discriminator():
+    model = Sequential()
+    model.add(Conv2D(64, kernel_size=3, strides=2, input_shape=(48, 48, 1), padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(Dropout(0.3))
+    
+    model.add(Conv2D(128, kernel_size=3, strides=2, padding="same"))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(Dropout(0.3))
+    
+    model.add(Flatten())
+    model.add(Dense(1, activation='sigmoid'))
+    
+    img = Input(shape=(48, 48, 1))
+    validity = model(img)
+    
+    return Model(img, validity)
+
+# GAN: Compile
+def build_gan(generator, discriminator):
+    discriminator.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=0.0002), metrics=['accuracy'])
+    discriminator.trainable = False
+    
+    noise = Input(shape=(100,))
+    fake_img = generator(noise)
+    validity = discriminator(fake_img)
+    
+    gan = Model(noise, validity)
+    gan.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=0.0002))
+    
+    return gan
+
+generator = build_generator()
+discriminator = build_discriminator()
+gan = build_gan(generator, discriminator)
+
+# Training GAN
+def train_gan(epochs=1000, batch_size=32):
+    half_batch = batch_size // 2
+
+    for epoch in range(epochs):
+        idx = np.random.randint(0, X_train.shape[0], half_batch)
+        real_imgs = X_train[idx]
+        
+        noise = np.random.normal(0, 1, (half_batch, 100))
+        fake_imgs = generator.predict(noise)
+
+        d_loss_real = discriminator.train_on_batch(real_imgs, np.ones((half_batch, 1)))
+        d_loss_fake = discriminator.train_on_batch(fake_imgs, np.zeros((half_batch, 1)))
+        d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+
+        noise = np.random.normal(0, 1, (batch_size, 100))
+        g_loss = gan.train_on_batch(noise, np.ones((batch_size, 1)))
+
+        if epoch % 100 == 0:
+            print(f"{epoch} [D loss: {d_loss[0]}] [G loss: {g_loss}]")
+
+train_gan(epochs=1000, batch_size=32)
+
+# Augment dataset with real and fake images
+n_fake_samples = X_train.shape[0]
+fake_images = generator.predict(np.random.normal(0, 1, (n_fake_samples, 100)))
+X_combined = np.concatenate((X_train, fake_images), axis=0)
+y_combined = np.concatenate((y_train_onehot, y_train_onehot), axis=0)
+
+# CNN Model (Feature Extraction for Boosting)
+def residual_block(x, filters, kernel_size=(5, 5)):
+    shortcut = x
+    x = Conv2D(filters, kernel_size, padding='same', activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Conv2D(filters, kernel_size, padding='same', activation='relu')(x)
+    x = BatchNormalization()(x)
+    if x.shape[-1] != shortcut.shape[-1]:
+        shortcut = Conv2D(filters, kernel_size=(1, 1), padding='same')(shortcut)
+    x = Add()([x, shortcut])
+    return Activation('relu')(x)
+
+def cnn_model():
+    inputs = Input(shape=(48, 48, 1))
+    x = Conv2D(128, (5, 5), activation='relu', padding='same')(inputs)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.1)(x)
+    x = residual_block(x, 256)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.2)(x)
+    x = residual_block(x, 512)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.3)(x)
+    x = residual_block(x, 1024)
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Dropout(0.4)(x)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(2048, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = Dense(1024, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = Dense(512, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    outputs = Dense(7, activation='softmax')(x)
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(loss=CategoricalCrossentropy(), metrics=['accuracy'], optimizer=Adam(learning_rate=1e-4))
+    return model
+
+cnn_model = cnn_model()
+
+# Learning Rate Scheduler and Callbacks
+def cosine_annealing(epoch, total_epochs=150, initial_lr=5e-5):
+    return initial_lr * (0.5 * (1 + np.cos(np.pi * epoch / total_epochs)))
+
+lr_scheduler = LearningRateScheduler(lambda epoch: cosine_annealing(epoch, total_epochs=150, initial_lr=5e-5))
+checkpoint = ModelCheckpoint('/kaggle/working/model_best.keras', save_best_only=True, mode='max', verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor='val_accuracy', factor=0.1, patience=3, min_lr=1e-6)
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+datagen = ImageDataGenerator(rotation_range=40, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.2, zoom_range=0.2, horizontal_flip=True, fill_mode='nearest')
+datagen.fit(X_train)
+
+# Train the Model
+history = cnn_model.fit(datagen.flow(X_combined, y_combined, batch_size=32),
+                        epochs=120,
+                        validation_data=(X_test, y_test_onehot),
+                        class_weight=class_weights_dict,
+                        callbacks=[checkpoint, lr_scheduler, reduce_lr, early_stopping])
+
+# Metrics and Evaluation
+y_pred_probs = cnn_model.predict(X_test)
+y_pred_classes = np.argmax(y_pred_probs, axis=1)
+y_test_classes = np.argmax(y_test_onehot, axis=1)
+
+print(f"Accuracy: {accuracy_score(y_test_classes, y_pred_classes):.4f}")
+print(f"Precision: {precision_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
+print(f"Recall: {recall_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
+print(f"F1-Score: {f1_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
+
+# Feature Extraction for Random Forest
+feature_extractor = cnn_model(inputs=model.input, outputs=model.get_layer("feature_dense").output)
+X_train_features = feature_extractor.predict(X_train)
+X_test_features = feature_extractor.predict(X_test)
+
+# Random Forest Training
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42)  
+rf_model.fit(X_train_features, y_train)
+y_pred_rf = rf_model.predict(X_test_features)
+
+# Model Evaluation
+print("Hybrid Model (GANs + CNN + Random Forest) Metrics:")
+print(f"Accuracy: {accuracy_score(y_test_classes, y_pred_rf):.4f}")
+print(f"Precision: {precision_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
+print(f"Recall: {recall_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
+print(f"F1-Score: {f1_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
+
+# Confusion Matrix 
+plt.figure(figsize=(10, 7))
+sns.heatmap(confusion_matrix(y_test_classes, y_pred_rf), annot=True, fmt='d', cmap='Oranges', xticklabels=label_map, yticklabels=label_map)
+plt.title('Hybrid Model (GANs + CNN + Random Forest) Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.show()
