@@ -1,230 +1,854 @@
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, BatchNormalization, Dropout, GlobalAveragePooling2D, Input, LeakyReLU, Flatten, Reshape, UpSampling2D, Add
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.losses import CategoricalCrossentropy
-from tensorflow.keras.utils import to_categorical
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras.callbacks import LearningRateScheduler, ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import seaborn as sns
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+from sklearn.ensemble import RandomForestClassifier
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Dense, Conv2D, MaxPooling2D, BatchNormalization, Dropout,
+    GlobalAveragePooling2D, LeakyReLU, Flatten, Reshape, UpSampling2D,
+    Add, Activation, Concatenate
+)
+from collections import Counter
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.callbacks import LearningRateScheduler, ModelCheckpoint, EarlyStopping
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from collections import Counter
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
-# Load dataset
-filename = '/kaggle/input/metadata-processed-csv/metadata_processed.csv'
-df = pd.read_csv(filename, names=['emotion', 'pixels', 'usage'], na_filter=False)
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
-def getData(filename):
-    Y, X = [], []
-    first = True
-    for line in open(filename):
-        if first:
-            first = False
-        else:
-            row = line.split(',')
-            Y.append(int(row[0]))
-            X.append([int(p) for p in row[1].split()])
-    return np.array(X) / 255.0, np.array(Y)
+FILENAME = '/kaggle/input/metadata-processed-csv/metadata_processed.csv'
+IMG_H, IMG_W = 48, 48
 
-X, Y = getData(filename)
+LATENT_DIM = 100
+USE_ACGAN = True
+ACGAN_EPOCHS = 150
+ACGAN_BATCH_SIZE = 64
+FAKE_RATIO = 0.3
+FILTER_FAKES_BY_D = True
+D_VALID_THRESH = 0.6
 
-# Data Preprocessing
-num_classes = len(set(Y))
-X = X.reshape(-1, 48, 48, 1)
-X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.1, random_state=0)
+EMOTION_NAMES = ['Angry','Disgust','Fear','Happy','Sad','Surprise','Neutral']
+
+def load_fer_csv(filename):
+    df = pd.read_csv(filename, header=None, names=['emotion','pixels','usage'],
+                     dtype=str, engine='python')
+
+
+    if isinstance(df.iloc[0, 0], str) and df.iloc[0, 0].strip().lower() == 'emotion':
+        df = df.iloc[1:].reset_index(drop=True)
+
+    df['emotion_num'] = pd.to_numeric(df['emotion'], errors='coerce')
+
+    def parse_pixels(s):
+        if not isinstance(s, str):
+            return None
+        arr = np.fromstring(s, sep=' ', dtype=np.float32)
+        if arr.size != IMG_H * IMG_W:
+            return None
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
+
+    px = df['pixels'].apply(parse_pixels)
+    mask = (~df['emotion_num'].isna()) & px.notna()
+    if not mask.any():
+        raise ValueError("No valid rows found in CSV. Expected columns [emotion,pixels,usage] with 2304 pixels.")
+
+    df_valid = df[mask].copy()
+    X_flat = np.vstack(px[mask].tolist())
+    y = df_valid['emotion_num'].astype(int).to_numpy()
+
+    X = (X_flat.astype(np.float32) / 255.0).reshape(-1, IMG_H, IMG_W, 1)
+
+    dropped = len(df) - len(df_valid)
+    if dropped > 0:
+        print(f"[load_fer_csv] Dropped {dropped} malformed rows (kept {len(df_valid)}).")
+    return X, y
+
+X, Y = load_fer_csv(FILENAME)
+
+uniq = np.unique(Y)
+print("Unique labels present:", uniq)
+
+bad = [u for u in uniq if u < 0 or u > 6]
+if bad:
+    print(f"[WARN] Found labels outside 0..6: {bad}. They will not be shown in the named plot.")
+
+# Build counts for indices 0..6 so x-axis has exactly 7 bars
+counts_dict = Counter(Y)
+counts_ordered = [counts_dict.get(i, 0) for i in range(7)]
+
+plt.figure(figsize=(8, 6))
+bars = plt.bar(range(7), counts_ordered, color='skyblue', edgecolor='black')
+plt.xlabel('Emotion Class')
+plt.ylabel('Number of Samples')
+plt.title('Class Distribution (FER-2013)')
+
+plt.xticks(ticks=range(7), labels=EMOTION_NAMES, rotation=0)
+
+output_path = '/kaggle/working/class_distribution.png'
+plt.savefig(output_path, format='png', dpi=300, bbox_inches='tight')
+plt.show()
+print(f"Class distribution plot saved at: {output_path}")
+
+print("Counts per class:")
+for i, name in enumerate(EMOTION_NAMES):
+    print(f"  {i} - {name:9s}: {counts_ordered[i]}")
+
+num_classes = int(min(7, len(uniq)))
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, Y, test_size=0.1, random_state=SEED, stratify=Y
+)
+
 y_train_onehot = to_categorical(y_train, num_classes=num_classes)
-y_test_onehot = to_categorical(y_test, num_classes=num_classes)
-class_weights = compute_class_weight('balanced', classes=np.unique(Y), y=Y)
+y_test_onehot  = to_categorical(y_test,  num_classes=num_classes)
+
+class_weights = compute_class_weight(
+    class_weight='balanced', classes=np.unique(y_train), y=y_train
+)
 class_weights_dict = dict(enumerate(class_weights))
+print("Computed class weights:", class_weights_dict)
+def build_generator_acgan(num_classes, latent_dim=LATENT_DIM):
+    z = Input(shape=(latent_dim,), name='z')
+    y_in = Input(shape=(num_classes,), name='class_onehot')
+    x = Concatenate(name='z_plus_y')([z, y_in])
 
-# GAN: Generator
-def build_generator():
-    model = Sequential()
-    model.add(Dense(128 * 12 * 12, activation="relu", input_dim=100))
-    model.add(Reshape((12, 12, 128)))
-    model.add(UpSampling2D())
-    model.add(Conv2D(128, kernel_size=3, padding="same"))
-    model.add(BatchNormalization(momentum=0.8))
-    model.add(LeakyReLU(alpha=0.2))
-    
-    model.add(UpSampling2D())
-    model.add(Conv2D(64, kernel_size=3, padding="same"))
-    model.add(BatchNormalization(momentum=0.8))
-    model.add(LeakyReLU(alpha=0.2))
+    g = Dense(128 * 12 * 12, activation="relu")(x)
+    g = Reshape((12, 12, 128))(g)
 
-    model.add(Conv2D(1, kernel_size=3, padding="same", activation='tanh'))
-    
-    noise = Input(shape=(100,))
-    img = model(noise)
-    
-    return Model(noise, img)
+    g = UpSampling2D()(g)
+    g = Conv2D(128, 3, padding="same")(g); g = BatchNormalization(momentum=0.8)(g); g = LeakyReLU(0.2)(g)
 
-# GAN: Discriminator
-def build_discriminator():
-    model = Sequential()
-    model.add(Conv2D(64, kernel_size=3, strides=2, input_shape=(48, 48, 1), padding="same"))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Dropout(0.3))
-    
-    model.add(Conv2D(128, kernel_size=3, strides=2, padding="same"))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(Dropout(0.3))
-    
-    model.add(Flatten())
-    model.add(Dense(1, activation='sigmoid'))
-    
-    img = Input(shape=(48, 48, 1))
-    validity = model(img)
-    
-    return Model(img, validity)
+    g = UpSampling2D()(g)
+    g = Conv2D(64, 3, padding="same")(g);  g = BatchNormalization(momentum=0.8)(g); g = LeakyReLU(0.2)(g)
 
-# GAN: Compile
-def build_gan(generator, discriminator):
-    discriminator.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=0.0002), metrics=['accuracy'])
-    discriminator.trainable = False
-    
-    noise = Input(shape=(100,))
-    fake_img = generator(noise)
-    validity = discriminator(fake_img)
-    
-    gan = Model(noise, validity)
-    gan.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=0.0002))
-    
-    return gan
+    g_out = Conv2D(1, 3, padding="same", activation='sigmoid', name='g_img')(g)  # [0,1]
+    return Model([z, y_in], g_out, name='G')
 
-generator = build_generator()
-discriminator = build_discriminator()
-gan = build_gan(generator, discriminator)
+def build_discriminator_acgan(num_classes):
+    img_in = Input(shape=(IMG_H, IMG_W, 1), name='img_in')
 
-# Training GAN
-def train_gan(epochs=1000, batch_size=32):
-    half_batch = batch_size // 2
+    d = Conv2D(64, 3, strides=2, padding="same")(img_in); d = LeakyReLU(0.2)(d); d = Dropout(0.3, name='drop_disc_1')(d)
+    d = Conv2D(128, 3, strides=2, padding="same")(d);      d = LeakyReLU(0.2)(d); d = Dropout(0.3, name='drop_disc_2')(d)
+    d = Flatten()(d)
 
+    validity = Dense(1, activation='sigmoid', name='validity')(d)
+    class_logits = Dense(num_classes, activation='softmax', name='class_logits')(d)
+
+    D = Model(img_in, [validity, class_logits], name='D')
+    D.compile(optimizer=Adam(learning_rate=2e-4),
+              loss=['binary_crossentropy', 'categorical_crossentropy'],
+              loss_weights=[1.0, 1.0],
+              metrics={'validity': 'accuracy', 'class_logits': 'accuracy'})
+    return D
+
+def build_acgan(G, D):
+    D.trainable = False
+    z2 = Input(shape=(LATENT_DIM,), name='z2')
+    y2 = Input(shape=(num_classes,), name='class_onehot2')
+    fake_imgs = G([z2, y2])
+    valid_pred, class_pred = D(fake_imgs)
+    ACGAN = Model([z2, y2], [valid_pred, class_pred], name='ACGAN')
+    ACGAN.compile(optimizer=Adam(learning_rate=2e-4),
+                  loss=['binary_crossentropy', 'categorical_crossentropy'],
+                  loss_weights=[1.0, 1.0])
+    return ACGAN
+
+def one_hot(y_idx, num_classes):
+    return tf.keras.utils.to_categorical(y_idx, num_classes)
+
+#GAN training loop
+def train_acgan(G, D, ACGAN, X_train, y_train, epochs=ACGAN_EPOCHS, batch_size=ACGAN_BATCH_SIZE, print_every=25):
+    n = X_train.shape[0]
     for epoch in range(epochs):
-        idx = np.random.randint(0, X_train.shape[0], half_batch)
+        # Train D on real
+        idx = np.random.randint(0, n, batch_size)
         real_imgs = X_train[idx]
-        
-        noise = np.random.normal(0, 1, (half_batch, 100))
-        fake_imgs = generator.predict(noise)
+        real_labels = one_hot(y_train[idx], num_classes)
+        y_valid = np.ones((batch_size, 1), dtype=np.float32)
+        D.train_on_batch(real_imgs, [y_valid, real_labels])
 
-        d_loss_real = discriminator.train_on_batch(real_imgs, np.ones((half_batch, 1)))
-        d_loss_fake = discriminator.train_on_batch(fake_imgs, np.zeros((half_batch, 1)))
-        d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+        # Train D on fake
+        z_samp = np.random.normal(0, 1, (batch_size, LATENT_DIM))
+        y_samp_idx = np.random.randint(0, num_classes, size=(batch_size,))
+        y_samp_oh  = one_hot(y_samp_idx, num_classes)
+        fake = G.predict([z_samp, y_samp_oh], verbose=0)
+        y_fake = np.zeros((batch_size, 1), dtype=np.float32)
+        D.train_on_batch(fake, [y_fake, y_samp_oh])
 
-        noise = np.random.normal(0, 1, (batch_size, 100))
-        g_loss = gan.train_on_batch(noise, np.ones((batch_size, 1)))
+        # Train G (via ACGAN combined)
+        z_samp = np.random.normal(0, 1, (batch_size, LATENT_DIM))
+        y_samp_idx = np.random.randint(0, num_classes, size=(batch_size,))
+        y_samp_oh  = one_hot(y_samp_idx, num_classes)
+        ACGAN.train_on_batch([z_samp, y_samp_oh], [np.ones((batch_size,1), dtype=np.float32), y_samp_oh])
 
-        if epoch % 100 == 0:
-            print(f"{epoch} [D loss: {d_loss[0]}] [G loss: {g_loss}]")
+        if epoch % print_every == 0:
+            print(f"[ACGAN] Epoch {epoch:04d}/{epochs}")
 
-train_gan(epochs=1000, batch_size=32)
+def generate_fakes_balanced(G, D, per_class, num_classes, latent_dim=LATENT_DIM,
+                            filter_by_D=True, valid_thresh=D_VALID_THRESH):
+    fake_list, label_list = [], []
+    for c in range(num_classes):
+        z = np.random.normal(0, 1, (per_class, latent_dim))
+        y_oh = np.zeros((per_class, num_classes), dtype=np.float32)
+        y_oh[:, c] = 1.0
+        fakes_c = G.predict([z, y_oh], verbose=0)
 
-# Augment dataset with real and fake images
-n_fake_samples = X_train.shape[0]
-fake_images = generator.predict(np.random.normal(0, 1, (n_fake_samples, 100)))
-X_combined = np.concatenate((X_train, fake_images), axis=0)
-y_combined = np.concatenate((y_train_onehot, y_train_onehot), axis=0)
+        if filter_by_D:
+            valid_scores, class_probs = D.predict(fakes_c, verbose=0)
+            pred_class = class_probs.argmax(axis=1)
+            keep = (valid_scores[:, 0] > valid_thresh) & (pred_class == c)
+            fakes_c = fakes_c[keep]
 
-# CNN Model (Feature Extraction for Boosting)
-def residual_block(x, filters, kernel_size=(5, 5)):
+        fake_list.append(fakes_c)
+        label_list.append(np.full((fakes_c.shape[0],), c, dtype=int))
+
+    if len(fake_list) == 0:
+        return np.empty((0, IMG_H, IMG_W, 1), dtype=np.float32), np.empty((0,), dtype=int)
+    fake_imgs = np.concatenate(fake_list, axis=0) #[combine everything]
+    fake_lbls = np.concatenate(label_list, axis=0)
+    return fake_imgs, fake_lbls
+
+# Train ACGAN and build augmented set (ACGAN true or false)
+if USE_ACGAN:    #******this is the main part actually
+    G = build_generator_acgan(num_classes, LATENT_DIM)
+    D = build_discriminator_acgan(num_classes)
+    ACGAN = build_acgan(G, D)
+    print("Training ACGAN ...")
+    train_acgan(G, D, ACGAN, X_train, y_train, epochs=ACGAN_EPOCHS, batch_size=ACGAN_BATCH_SIZE, print_every=25)
+
+    k = int(FAKE_RATIO * len(X_train))
+    per_class = max(1, k // num_classes)
+    fake_imgs, fake_lbls = generate_fakes_balanced(G, D, per_class, num_classes)
+    print(f"Generated kept fakes: {fake_imgs.shape[0]}")
+
+    X_sup = np.concatenate([X_train, fake_imgs], axis=0) if fake_imgs.size else X_train
+    y_sup = np.concatenate([y_train, fake_lbls], axis=0) if fake_imgs.size else y_train
+else:
+    X_sup, y_sup = X_train, y_train # (just make scence whether the model is accurate)
+
+def residual_block(x, filters, kernel_size=(5,5), name_prefix='res'):
     shortcut = x
-    x = Conv2D(filters, kernel_size, padding='same', activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Conv2D(filters, kernel_size, padding='same', activation='relu')(x)
-    x = BatchNormalization()(x)
+    x = Conv2D(filters, kernel_size, padding='same', activation='relu', name=f'{name_prefix}_c1')(x)
+    x = BatchNormalization(name=f'{name_prefix}_bn1')(x)
+    x = Conv2D(filters, kernel_size, padding='same', activation='relu', name=f'{name_prefix}_c2')(x)
+    x = BatchNormalization(name=f'{name_prefix}_bn2')(x)
     if x.shape[-1] != shortcut.shape[-1]:
-        shortcut = Conv2D(filters, kernel_size=(1, 1), padding='same')(shortcut)
-    x = Add()([x, shortcut])
-    return Activation('relu')(x)
+        shortcut = Conv2D(filters, (1,1), padding='same', name=f'{name_prefix}_proj')(shortcut)
+    x = Add(name=f'{name_prefix}_add')([x, shortcut])
+    return Activation('relu', name=f'{name_prefix}_out')(x)
 
-def cnn_model():
-    inputs = Input(shape=(48, 48, 1))
-    x = Conv2D(128, (5, 5), activation='relu', padding='same')(inputs)
-    x = BatchNormalization()(x)
-    x = MaxPooling2D(pool_size=(2, 2))(x)
-    x = Dropout(0.1)(x)
-    x = residual_block(x, 256)
-    x = MaxPooling2D(pool_size=(2, 2))(x)
-    x = Dropout(0.2)(x)
-    x = residual_block(x, 512)
-    x = MaxPooling2D(pool_size=(2, 2))(x)
-    x = Dropout(0.3)(x)
-    x = residual_block(x, 1024)
-    x = MaxPooling2D(pool_size=(2, 2))(x)
-    x = Dropout(0.4)(x)
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(2048, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-    x = Dense(1024, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-    x = Dense(512, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-    x = Dense(128, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.4)(x)
-    outputs = Dense(7, activation='softmax')(x)
-    model = Model(inputs=inputs, outputs=outputs)
+def build_cnn(num_classes):
+    inputs = Input(shape=(IMG_H, IMG_W, 1), name='input_image')
+    x = Conv2D(128, (5,5), activation='relu', padding='same', name='stem_c')(inputs)
+    x = BatchNormalization(name='stem_bn')(x)
+    x = MaxPooling2D(pool_size=(2,2), name='stem_pool')(x)
+    x = Dropout(0.1, name='drop_stem')(x)
+
+    x = residual_block(x, 256, name_prefix='res256')
+    x = MaxPooling2D(pool_size=(2,2), name='pool256')(x)
+    x = Dropout(0.2, name='drop256_block')(x)
+
+    x = residual_block(x, 512, name_prefix='res512')
+    x = MaxPooling2D(pool_size=(2,2), name='pool512')(x)
+    x = Dropout(0.3, name='drop512_block')(x)
+
+    x = residual_block(x, 1024, name_prefix='res1024')
+    x = MaxPooling2D(pool_size=(2,2), name='pool1024')(x)
+    x = Dropout(0.4, name='drop1024_block')(x)
+
+    x = GlobalAveragePooling2D(name='gap')(x)
+
+    x = Dense(2048, activation='relu', name='dense2048')(x)
+    x = BatchNormalization(name='bn2048')(x)
+    x = Dropout(0.4, name='drop2048_fc')(x)
+
+    x = Dense(1024, activation='relu', name='dense1024')(x)
+    x = BatchNormalization(name='bn1024')(x)
+    x = Dropout(0.4, name='drop1024_fc')(x)
+
+    x = Dense(512, activation='relu', name='dense512')(x)
+    x = BatchNormalization(name='bn512')(x)
+    x = Dropout(0.4, name='drop512_fc')(x)
+
+    x = Dense(128, activation='relu', name='feature_dense')(x)
+    x = BatchNormalization(name='feature_bn')(x)
+    x = Dropout(0.4, name='feature_drop')(x)
+
+    outputs = Dense(num_classes, activation='softmax', name='logits')(x)
+    model = Model(inputs=inputs, outputs=outputs, name='emotion_cnn')
     model.compile(loss=CategoricalCrossentropy(), metrics=['accuracy'], optimizer=Adam(learning_rate=1e-4))
     return model
 
-cnn_model = cnn_model()
-
-# Learning Rate Scheduler and Callbacks
+cnn_model = build_cnn(num_classes)
+# learner
 def cosine_annealing(epoch, total_epochs=150, initial_lr=5e-5):
     return initial_lr * (0.5 * (1 + np.cos(np.pi * epoch / total_epochs)))
 
-lr_scheduler = LearningRateScheduler(lambda epoch: cosine_annealing(epoch, total_epochs=150, initial_lr=5e-5))
-checkpoint = ModelCheckpoint('/kaggle/working/model_best.keras', save_best_only=True, mode='max', verbose=1)
-reduce_lr = ReduceLROnPlateau(monitor='val_accuracy', factor=0.1, patience=3, min_lr=1e-6)
+lr_scheduler = LearningRateScheduler(lambda e: cosine_annealing(e, total_epochs=150, initial_lr=5e-5))
+
+checkpoint = ModelCheckpoint('/kaggle/working/model_best.keras',
+                             monitor='val_accuracy', mode='max',
+                             save_best_only=True, verbose=1)
+
 early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-datagen = ImageDataGenerator(rotation_range=40, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.2, zoom_range=0.2, horizontal_flip=True, fill_mode='nearest')
-datagen.fit(X_train)
+callbacks = [checkpoint, lr_scheduler, early_stopping]
 
-# Train the Model
-history = cnn_model.fit(datagen.flow(X_combined, y_combined, batch_size=32),
-                        epochs=120,
-                        validation_data=(X_test, y_test_onehot),
-                        class_weight=class_weights_dict,
-                        callbacks=[checkpoint, lr_scheduler, reduce_lr, early_stopping])
 
-# Metrics and Evaluation
-y_pred_probs = cnn_model.predict(X_test)
+# Train CNN (with augmentation)
+datagen = ImageDataGenerator(
+    rotation_range=40, width_shift_range=0.2, height_shift_range=0.2,
+    shear_range=0.2, zoom_range=0.2, horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+history = cnn_model.fit(
+    datagen.flow(X_sup, to_categorical(y_sup, num_classes), batch_size=32, shuffle=True),
+    epochs=120,
+    validation_data=(X_test, y_test_onehot),
+    class_weight=class_weights_dict, 
+    callbacks=callbacks,
+    verbose=1
+)
+
+hist = history.history
+
+loss_key     = 'loss'
+val_loss_key = 'val_loss'
+acc_key      = 'accuracy' if 'accuracy' in hist else 'acc'
+val_acc_key  = 'val_accuracy' if 'val_accuracy' in hist else 'val_acc'
+
+epochs = range(1, len(hist[loss_key]) + 1)
+
+plt.figure(figsize=(14, 5))
+
+# Accuracy
+plt.subplot(1, 2, 1)
+plt.plot(epochs, hist[acc_key],     label='Train Accuracy')
+plt.plot(epochs, hist[val_acc_key], label='Val Accuracy')
+plt.title('Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# Loss
+plt.subplot(1, 2, 2)
+plt.plot(epochs, hist[loss_key],     label='Train Loss')
+plt.plot(epochs, hist[val_loss_key], label='Val Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+
+# Save PNG to Kaggle working/output
+os.makedirs("/kaggle/working", exist_ok=True)
+png_path = "/kaggle/working/training_curves.png"
+plt.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+print(f"Training curves saved to: {png_path}")
+
+plt.show()
+
+# Evaluation: CNN softmax head
+y_pred_probs = cnn_model.predict(X_test, verbose=0)
 y_pred_classes = np.argmax(y_pred_probs, axis=1)
 y_test_classes = np.argmax(y_test_onehot, axis=1)
 
-print(f"Accuracy: {accuracy_score(y_test_classes, y_pred_classes):.4f}")
+print("\n=== CNN Softmax Head Metrics ===")
+print(f"Accuracy : {accuracy_score(y_test_classes, y_pred_classes):.4f}")
 print(f"Precision: {precision_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
-print(f"Recall: {recall_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
-print(f"F1-Score: {f1_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
+print(f"Recall   : {recall_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
+print(f"F1-Score : {f1_score(y_test_classes, y_pred_classes, average='weighted'):.4f}")
 
-# Feature Extraction for Random Forest
-feature_extractor = cnn_model(inputs=model.input, outputs=model.get_layer("feature_dense").output)
-X_train_features = feature_extractor.predict(X_train)
-X_test_features = feature_extractor.predict(X_test)
+feature_extractor = Model(inputs=cnn_model.input,
+                          outputs=cnn_model.get_layer("feature_dense").output)
 
-# Random Forest Training
-rf_model = RandomForestClassifier(n_estimators=100, random_state=42)  
+X_train_features = feature_extractor.predict(X_train, verbose=0)
+X_test_features  = feature_extractor.predict(X_test,  verbose=0)
+
+rf_model = RandomForestClassifier(n_estimators=300, random_state=SEED, n_jobs=-1)
 rf_model.fit(X_train_features, y_train)
 y_pred_rf = rf_model.predict(X_test_features)
 
-# Model Evaluation
-print("Hybrid Model (GANs + CNN + Random Forest) Metrics:")
-print(f"Accuracy: {accuracy_score(y_test_classes, y_pred_rf):.4f}")
+print("\n=== Hybrid (CNN features + RandomForest) Metrics ===")
+print(f"Accuracy : {accuracy_score(y_test_classes, y_pred_rf):.4f}")
 print(f"Precision: {precision_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
-print(f"Recall: {recall_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
-print(f"F1-Score: {f1_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
+print(f"Recall   : {recall_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
+print(f"F1-Score : {f1_score(y_test_classes, y_pred_rf, average='weighted'):.4f}")
 
-# Confusion Matrix 
-plt.figure(figsize=(10, 7))
-sns.heatmap(confusion_matrix(y_test_classes, y_pred_rf), annot=True, fmt='d', cmap='Oranges', xticklabels=label_map, yticklabels=label_map)
-plt.title('Hybrid Model (GANs + CNN + Random Forest) Confusion Matrix')
-plt.xlabel('Predicted')
-plt.ylabel('Actual')
-plt.show()
+
+label_map = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral'][:num_classes]
+
+def plot_cm_counts_pct(cm, class_names, title="", cmap='Oranges', save_png_path=None):
+    """
+    Display a confusion matrix with each cell annotated as:
+      count
+      (row %)
+    and save it as an SVG file if save_svg_path is provided.
+    """
+    cm = np.asarray(cm, dtype=np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        cm_pct = 100.0 * cm / row_sums  # row-wise percentage
+
+    plt.figure(figsize=(8, 6))
+    ax = sns.heatmap(
+        cm, annot=False, cmap=cmap, cbar=True,
+        xticklabels=class_names, yticklabels=class_names,
+        linewidths=0.5
+    )
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            count = int(round(cm[i, j]))
+            pct = cm_pct[i, j]
+            txt = f"{count}\n({pct:.2f}%)" if not np.isnan(pct) else f"{count}"
+            ax.text(j + 0.5, i + 0.5, txt, ha='center', va='center', fontsize=10, color='black')
+
+    plt.title(title, fontsize=14, pad=12)
+    plt.xlabel('Predicted Emotion', fontsize=12)
+    plt.ylabel('True Emotion', fontsize=12)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+
+    # Save as SVG in the output directory (if specified)
+    if save_png_path:
+        os.makedirs(os.path.dirname(save_png_path), exist_ok=True)
+        plt.savefig(save_png_path, format='png', dpi=300, bbox_inches='tight')
+        print(f"Confusion matrix saved as SVG at: {save_png_path}")
+
+    plt.show()
+
+cm_emotion = confusion_matrix(y_test_classes, y_pred_rf)
+
+output_path_png = "/kaggle/working/emotion_confusion_matrix.png"
+
+plot_cm_counts_pct(
+    cm_emotion,
+    label_map,
+    title="Hybrid Model (ACGAN Aug + CNN features + RandomForest) — Emotion Confusion Matrix",
+    cmap='Oranges',
+    save_png_path=output_path_png
+)
+import os, glob, numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras.preprocessing import image
+from sklearn.metrics import confusion_matrix
+
+AFFECTNET_DIR = "/kaggle/input/test-data/AffectNet"
+OUT_DIR = "/kaggle/working"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+affectnet_classes = ['Angry','Disgust','Fear','Happy','Sad','Surprise','Neutral']
+
+def load_and_preprocess_image_48(img_path):
+    """Load image, convert to 48x48 grayscale in [0,1], shape (1,48,48,1)."""
+    img = image.load_img(img_path, target_size=(48, 48), color_mode='grayscale')
+    arr = image.img_to_array(img) / 255.0
+    return np.expand_dims(arr, axis=0)
+
+def map_emotion_to_arousal_valence(emotion):
+    mapping = {
+        'Happy': (0.2, 0.8),
+        'Sad': (0.1, -0.5),
+        'Fear': (0.9, -0.8),
+        'Anger': (0.9, -0.7),
+        'Disgust': (0.7, -0.6),
+        'Surprise': (0.8, 0.4),
+        'Neutral': (0.1, 0.0)
+    }
+    return mapping.get(emotion, (0.0, 0.0))
+
+def av_to_stress_4lvl(arousal, valence):
+    if arousal >= 0.8 and valence < -0.4:
+        return 3  # High
+    elif (0.5 <= arousal < 0.8 and valence < -0.2):
+        return 2  # Moderate
+    elif (0.2 <= arousal < 0.5) and (valence >= -0.2):
+        return 1  # Low
+    else:
+        return 0  # Very Low
+
+def av_to_stress_binary(arousal, valence):
+    return 1 if (arousal >= 0.7 and valence < 0.0) or (arousal >= 0.5 and valence < 0.0) else 0
+
+def plot_cm_counts_pct(cm, class_names, title="", cmap='Blues', save_png_path=None):
+    """Heatmap with 'count' and '(row %)' per cell; saves PNG if path is given."""
+    cm = np.asarray(cm, dtype=np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        cm_pct = 100.0 * cm / row_sums
+
+    plt.figure(figsize=(7, 6))
+    ax = sns.heatmap(cm, annot=False, cmap=cmap, cbar=True,
+                     xticklabels=class_names, yticklabels=class_names,
+                     linewidths=0.5)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            count = int(round(cm[i, j]))
+            pct = cm_pct[i, j]
+            txt = f"{count}\n({pct:.2f}%)" if not np.isnan(pct) else f"{count}"
+            ax.text(j + 0.5, i + 0.5, txt, ha='center', va='center',
+                    fontsize=10, color='black')
+
+    plt.title(title, fontsize=14, pad=12)
+    plt.xlabel('Predicted', fontsize=12)
+    plt.ylabel('True', fontsize=12)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+    if save_png_path:
+        os.makedirs(os.path.dirname(save_png_path), exist_ok=True)
+        plt.savefig(save_png_path, format='png', dpi=300, bbox_inches='tight')
+        print(f"Saved PNG: {save_png_path}")
+    plt.show()
+
+pairs = []  # list of (filepath, true_emotion)
+for cls in affectnet_classes:
+    cls_dir = os.path.join(AFFECTNET_DIR, cls)
+    files = []
+    for ext in ("*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff"):
+        files.extend(glob.glob(os.path.join(cls_dir, ext)))
+    if len(files) == 0:
+        print(f"[warn] No files found for class: {cls} in {cls_dir}")
+        continue
+    # use ALL files in each class folder
+    pairs.extend([(p, cls) for p in sorted(files)])
+
+print(f"Found {len(pairs)} images across {len(affectnet_classes)} classes under: {AFFECTNET_DIR}")
+
+true_emotions, pred_emotions = [], []
+for img_path, true_cls in pairs:
+    x = load_and_preprocess_image_48(img_path)      
+    feat = feature_extractor.predict(x, verbose=0)   
+    pred_idx = rf_model.predict(feat)[0]              
+    pred_cls = affectnet_classes[pred_idx] if pred_idx < len(affectnet_classes) else affectnet_classes[-1]
+    true_emotions.append(true_cls)
+    pred_emotions.append(pred_cls)
+
+cm_emotion = confusion_matrix(true_emotions,
+                              pred_emotions,
+                              labels=affectnet_classes)
+
+emotion_cm_path = os.path.join(OUT_DIR, "emotion_cm_affectnet.png")
+plot_cm_counts_pct(
+    cm_emotion,
+    affectnet_classes,
+    title="Emotion Confusion Matrix (AffectNet test-data, Hybrid model)",
+    cmap='Oranges',
+    save_png_path=emotion_cm_path
+)
+
+true_stress4 = [av_to_stress_4lvl(*map_emotion_to_arousal_valence(e)) for e in true_emotions]
+pred_stress4 = [av_to_stress_4lvl(*map_emotion_to_arousal_valence(e)) for e in pred_emotions]
+stress4_labels = ['Very Low', 'Low', 'Moderate', 'High']
+cm_stress4 = confusion_matrix(true_stress4, pred_stress4, labels=[0,1,2,3])
+plot_cm_counts_pct(cm_stress4, stress4_labels,
+                   title="Stress Estimation Confusion Matrix (4 levels, AffectNet test-data)",
+                   cmap='Purples',
+                   save_png_path=os.path.join(OUT_DIR, "stress_cm_affectnet_4lvl.png"))
+
+true_stress2 = [av_to_stress_binary(*map_emotion_to_arousal_valence(e)) for e in true_emotions]
+pred_stress2 = [av_to_stress_binary(*map_emotion_to_arousal_valence(e)) for e in pred_emotions]
+stress2_labels = ['stress_free', 'stressful']
+cm_stress2 = confusion_matrix(true_stress2, pred_stress2, labels=[0,1])
+plot_cm_counts_pct(cm_stress2, stress2_labels,
+                   title="Stress Estimation Confusion Matrix (Binary, AffectNet test-data)",
+                   cmap='Greens',
+                   save_png_path=os.path.join(OUT_DIR, "stress_cm_affectnet_binary.png"))
+!pip -q install fer==22.5.1 opencv-python-headless==4.10.0.84
+
+import os, glob, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cv2
+
+from tensorflow.keras.preprocessing import image
+from sklearn.metrics import confusion_matrix
+from fer import FER
+
+SHOP_DIR = "/kaggle/input/shop-floor-images/images"  
+OUT_DIR  = "/kaggle/working"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Class order must match your model
+label_map = ['Angry','Disgust','Fear','Happy','Sad','Surprise','Neutral'][:num_classes]
+emo_to_idx = {e: i for i, e in enumerate(label_map)}
+
+def load_and_preprocess_image_48(img_path):
+    """Load image, convert to 48x48 grayscale in [0,1], shape (1,48,48,1)."""
+    img = image.load_img(img_path, target_size=(48, 48), color_mode='grayscale')
+    arr = image.img_to_array(img) / 255.0
+    return np.expand_dims(arr, axis=0)
+
+def map_emotion_to_arousal_valence(emotion):
+    # normalise FER's 'anger' to 'Angry', etc, later
+    mapping = {
+        'Happy':   (0.2,  0.8),
+        'Sad':     (0.1, -0.5),
+        'Fear':    (0.9, -0.8),
+        'Angry':   (0.9, -0.7),
+        'Disgust': (0.7, -0.6),
+        'Surprise':(0.8,  0.4),
+        'Neutral': (0.1,  0.0),
+    }
+    return mapping.get(emotion, (0.0, 0.0))
+
+def av_to_stress_binary(a, v):
+    """Binary stress: 0 = stress_free, 1 = stressful."""
+    return 1 if (a >= 0.7 and v < 0.0) or (a >= 0.5 and v < 0.0) else 0
+
+def plot_cm_counts_pct(cm, class_names, title, cmap, save_path):
+    """Confusion matrix with counts + row %; save as PNG."""
+    cm = np.asarray(cm, dtype=np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cm_pct = 100.0 * cm / row_sums
+
+    plt.figure(figsize=(7, 6))
+    ax = sns.heatmap(
+        cm,
+        annot=False,
+        cmap=cmap,
+        cbar=True,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        linewidths=0.5,
+    )
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            count = int(round(cm[i, j]))
+            pct = cm_pct[i, j]
+            txt = f"{count}\n({pct:.1f}%)" if not np.isnan(pct) else f"{count}"
+            ax.text(j + 0.5, i + 0.5, txt,
+                    ha="center", va="center", fontsize=9, color="black")
+
+    plt.title(title, fontsize=14, pad=12)
+    plt.xlabel("Predicted", fontsize=12)
+    plt.ylabel("True", fontsize=12)
+    plt.xticks(rotation=45, ha="right", fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(save_path, format="png", dpi=300, bbox_inches="tight")
+    plt.show()
+    print(f"Saved: {save_path}")
+
+img_exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff","*.webp")
+img_paths = []
+for ext in img_exts:
+    img_paths.extend(glob.glob(os.path.join(SHOP_DIR, ext)))
+img_paths = sorted(img_paths)
+
+print(f"[info] Found {len(img_paths)} images in {SHOP_DIR}")
+if len(img_paths) == 0:
+    raise RuntimeError("No images found. Check SHOP_DIR.")
+
+detector = FER(mtcnn=False)   
+
+def fer_top_emotion_bgr(img_path):
+    """Return FER's top emotion mapped to our label set, or None if no face."""
+    bgr = cv2.imread(img_path)
+    if bgr is None:
+        return None
+    results = detector.detect_emotions(bgr)
+    if not results:
+        return None
+
+    # choose largest face
+    largest = max(results, key=lambda r: r["box"][2] * r["box"][3])
+    probs = largest["emotions"]
+
+    fer_to_ours = {
+        "angry":   "Angry",
+        "disgust": "Disgust",
+        "fear":    "Fear",
+        "happy":   "Happy",
+        "sad":     "Sad",
+        "surprise":"Surprise",
+        "neutral": "Neutral",
+    }
+    best_key = max(probs, key=probs.get)
+    return fer_to_ours.get(best_key, None)
+
+rows = []
+skipped = 0
+
+for p in img_paths:
+    # proxy true label from FER
+    proxy_true = fer_top_emotion_bgr(p)
+
+    if proxy_true is None or proxy_true not in emo_to_idx:
+        skipped += 1
+        continue
+
+    x = load_and_preprocess_image_48(p)
+    feat = feature_extractor.predict(x, verbose=0)
+    pred_idx = rf_model.predict(feat)[0]
+    pred_emotion = label_map[pred_idx] if 0 <= pred_idx < len(label_map) else label_map[-1]
+
+    a_true, v_true = map_emotion_to_arousal_valence(proxy_true)
+    a_pred, v_pred = map_emotion_to_arousal_valence(pred_emotion)
+    true_stress_bin = av_to_stress_binary(a_true, v_true)
+    pred_stress_bin = av_to_stress_binary(a_pred, v_pred)
+
+    rows.append({
+        "filename": os.path.basename(p),
+        "path": p,
+        "true_emotion_proxy": proxy_true,
+        "pred_emotion": pred_emotion,
+        "true_stress_bin": true_stress_bin,
+        "pred_stress_bin": pred_stress_bin
+    })
+
+print(f"[info] Usable images (face detected by FER): {len(rows)} | Skipped: {skipped}")
+
+df = pd.DataFrame(rows)
+csv_path = os.path.join(OUT_DIR, "shopfloor_proxy_vs_neuronetgan.csv")
+df.to_csv(csv_path, index=False)
+print(f"Saved proxy vs prediction CSV: {csv_path}")
+
+if df.empty:
+    raise RuntimeError("FER could not detect any faces. No matrices can be built.")
+
+y_true_emo = df["true_emotion_proxy"].tolist()
+y_pred_emo = df["pred_emotion"].tolist()
+
+# convert to indices, respecting label_map order
+y_true_idx = [emo_to_idx[e] for e in y_true_emo]
+y_pred_idx = [emo_to_idx[e] for e in y_pred_emo]
+
+emo_cm = confusion_matrix(y_true_idx, y_pred_idx, labels=list(range(len(label_map))))
+
+emo_cm_path = os.path.join(OUT_DIR, "shopfloor_emotion_confusion_proxy.png")
+plot_cm_counts_pct(
+    emo_cm,
+    label_map,
+    title="Shop-floor Emotion Confusion Matrix\n(True = FER proxy, Pred = NeuroNetGAN RF head)",
+    cmap="Oranges",
+    save_path=emo_cm_path
+)
+y_true_stress = df["true_stress_bin"].tolist()
+y_pred_stress = df["pred_stress_bin"].tolist()
+
+stress_labels = ["stress_free", "stressful"]
+stress_cm = confusion_matrix(y_true_stress, y_pred_stress, labels=[0,1])
+
+stress_cm_path = os.path.join(OUT_DIR, "shopfloor_stress_confusion_binary_proxy.png")
+plot_cm_counts_pct(
+    stress_cm,
+    stress_labels,
+    title="Shop-floor Stress Estimation Confusion Matrix (Binary)\n(True = FER proxy, Pred = NeuroNetGAN)",
+    cmap="Greens",
+    save_path=stress_cm_path
+)
+import os, numpy as np, matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing import image
+
+label_map = ['Angry','Disgust','Fear','Happy','Sad','Surprise','Neutral'][:num_classes]
+
+EMAP = {
+    'Angry':   (0.9, -0.7),
+    'Disgust': (0.7, -0.6),
+    'Fear':    (0.9, -0.8),
+    'Happy':   (0.2,  0.8),
+    'Sad':     (0.1, -0.5),
+    'Surprise':(0.8,  0.4),
+    'Neutral': (0.1,  0.0),
+}
+EMO_ORDER = label_map
+
+def load_and_preprocess_image_48(img_path):
+    img = image.load_img(img_path, target_size=(48, 48), color_mode='grayscale')
+    arr = image.img_to_array(img) / 255.0
+    return np.expand_dims(arr, axis=0)
+
+def rf_av_from_probs(prob_vector):
+    """Weighted Arousal & Valence from RF probabilities."""
+    a = sum(prob_vector[i] * EMAP[EMO_ORDER[i]][0] for i in range(len(EMO_ORDER)))
+    v = sum(prob_vector[i] * EMAP[EMO_ORDER[i]][1] for i in range(len(EMO_ORDER)))
+    return a, v
+
+def av_to_stress_binary(a, v):
+    """0=stress_free, 1=stressful (binary only)."""
+    return 1 if (a >= 0.7 and v < 0.0) or (a >= 0.5 and v < 0.0) else 0
+
+def predict_single_image_dashboard_binary(img_path, feature_extractor, rf_model, label_map, save_png_path=None):
+    """Show the input image + ONLY Arousal & Valence bars, with binary stress text."""
+    # 1) Load image for display
+    img_disp = image.load_img(img_path, target_size=(256, 256), color_mode='rgb')
+
+    x = load_and_preprocess_image_48(img_path)
+    feat = feature_extractor.predict(x, verbose=0)   
+    proba = rf_model.predict_proba(feat)[0]        
+    pred_idx = int(np.argmax(proba))
+    pred_emotion = label_map[pred_idx]
+
+    a, v = rf_av_from_probs(proba)
+    stress2 = av_to_stress_binary(a, v)  # 0/1
+    stress_txt = 'stressful' if stress2 else 'stress_free'
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+    axes[0].imshow(img_disp)
+    axes[0].axis('off')
+    axes[0].set_title(f"Predicted Emotion: {pred_emotion}", fontsize=14, weight='bold')
+
+    cats = ['Arousal', 'Valence']
+    vals = [a, v]
+    axes[1].barh(cats, vals, edgecolor='black')
+    axes[1].set_xlim(-1.0, 1.0)
+    axes[1].set_title(f"Arousal & Valence  |  Stress: {stress_txt}", fontsize=12)
+    axes[1].set_xlabel('Value')
+
+    axes[1].text(a + (0.03 if a >= 0 else -0.03), 0, f"{a:.2f}",
+                 va='center', ha='left' if a >= 0 else 'right')
+    axes[1].text(v + (0.03 if v >= 0 else -0.03), 1, f"{v:.2f}",
+                 va='center', ha='left' if v >= 0 else 'right')
+
+    plt.tight_layout()
+    if save_png_path:
+        os.makedirs(os.path.dirname(save_png_path), exist_ok=True)
+        plt.savefig(save_png_path, format='png', dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_png_path}")
+    plt.show()
+
+    print("=== Prediction Summary (Binary Stress) ===")
+    print(f"Predicted Emotion: {pred_emotion}")
+    print(f"Probabilities (order={label_map}): {np.round(proba, 3)}")
+    print(f"Arousal = {a:.3f}, Valence = {v:.3f}")
+    print(f"Stress (binary) = {stress_txt}")
+
+img_path = "/kaggle/input/shop-floor-images/images/WhatsApp Image 2025-10-17 at 00.06.14_31a5fd4a.jpg" 
+out_path = "/kaggle/working/single_image_AV_dashboard_binary.png"
+
+predict_single_image_dashboard_binary(
+    img_path=img_path,
+    feature_extractor=feature_extractor,
+    rf_model=rf_model,
+    label_map=label_map,
+    save_png_path=out_path
+)
